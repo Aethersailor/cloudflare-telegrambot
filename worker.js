@@ -32,9 +32,18 @@ function apiUrl(methodName, params = null) {
   return `https://api.telegram.org/bot${TOKEN}/${methodName}${query}`
 }
 
-function requestTelegram(methodName, body, params = null) {
-  return fetch(apiUrl(methodName, params), body)
-    .then(r => r.json())
+async function requestTelegram(methodName, body, params = null) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 10000)
+  try {
+    const response = await fetch(apiUrl(methodName, params), { ...(body || {}), signal: controller.signal })
+    return await response.json()
+  } catch {
+    // Provider errors must not expose a URL containing the bot token.
+    throw new Error('Telegram API request failed')
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function makeReqBody(body) {
@@ -965,8 +974,9 @@ async function forwardMessageU2A(message) {
             errorText.includes('topic not found')) {
           
           // 创建一个错误对象来触发删除处理
-          const deleteError = new Error('Topic deleted')
-          deleteError.description = sent.description || 'Topic deleted'
+          const deleteError = Object.assign(new Error('Topic deleted'), {
+            description: sent.description || 'Topic deleted'
+          })
           throw deleteError
         }
       }
@@ -1925,13 +1935,47 @@ async function onUpdate(update) {
  * 处理 Webhook 请求
  */
 async function handleWebhook(event) {
-  // 验证密钥
-  if (event.request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== SECRET) {
-    return new Response('Unauthorized', { status: 403 })
+  const request = event.request
+  if ((request.headers.get('content-type') || '').split(';')[0].trim().toLowerCase() !== 'application/json') {
+    return new Response('Unsupported Media Type', { status: 415 })
   }
-
-  // 读取更新
-  const update = await event.request.json()
+  const maxBytes = 128 * 1024
+  const declaredLength = Number(request.headers.get('content-length'))
+  if (declaredLength > maxBytes) {
+    await request.body?.cancel().catch(() => {})
+    return new Response('Payload Too Large', { status: 413 })
+  }
+  if (!request.body) return new Response('Bad Request', { status: 400 })
+  const reader = request.body.getReader()
+  const chunks = []
+  let totalBytes = 0
+  let update
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      totalBytes += value.byteLength
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => {})
+        return new Response('Payload Too Large', { status: 413 })
+      }
+      chunks.push(value)
+    }
+    const bytes = new Uint8Array(totalBytes)
+    let offset = 0
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    update = JSON.parse(new TextDecoder().decode(bytes))
+    if (!update || typeof update !== 'object' || Array.isArray(update)) {
+      return new Response('Bad Request', { status: 400 })
+    }
+  } catch {
+    return new Response('Bad Request', { status: 400 })
+  } finally {
+    reader.releaseLock()
+  }
   
   // 异步处理更新
   event.waitUntil(onUpdate(update))
@@ -1945,15 +1989,8 @@ async function handleWebhook(event) {
 async function registerWebhook(event, requestUrl, suffix, secret) {
   const webhookUrl = `${requestUrl.protocol}//${requestUrl.hostname}${suffix}`
   
-  // 调试信息
-  console.log('🔧 Webhook 注册详情:')
-  console.log('TOKEN:', TOKEN ? `前10位: ${TOKEN.slice(0, 10)}...` : '❌ 未配置')
-  console.log('SECRET:', secret ? '✅ 已配置' : '❌ 未配置')
-  console.log('Webhook URL:', webhookUrl)
-  console.log('API URL:', apiUrl('setWebhook'))
-  
   // 注册 Webhook（包含 message_reaction 以支持 reaction 双向同步）
-  const r = await fetch(apiUrl('setWebhook'), {
+  const result = await requestTelegram('setWebhook', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -1965,12 +2002,11 @@ async function registerWebhook(event, requestUrl, suffix, secret) {
     }),
   })
 
-  const result = await r.json()
   console.log('📡 Telegram API 响应:', result)
   
   // 注册机器人命令（只注册 /start，其他命令隐藏）
   try {
-    const commandsResult = await fetch(apiUrl('setMyCommands'), {
+    const commandsData = await requestTelegram('setMyCommands', {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -1984,7 +2020,6 @@ async function registerWebhook(event, requestUrl, suffix, secret) {
         ]
       }),
     })
-    const commandsData = await commandsResult.json()
     console.log('📋 命令注册响应:', commandsData)
   } catch (error) {
     console.error('❌ 命令注册失败:', error)
@@ -1999,7 +2034,7 @@ async function registerWebhook(event, requestUrl, suffix, secret) {
  * 注销 Webhook
  */
 async function unRegisterWebhook(event) {
-  const r = await fetch(apiUrl('setWebhook'), {
+  const result = await requestTelegram('setWebhook', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -2009,7 +2044,7 @@ async function unRegisterWebhook(event) {
     }),
   })
 
-  return new Response('ok' in (await r.json()) ? 'Ok' : 'Error')
+  return new Response('ok' in result ? 'Ok' : 'Error')
 }
 
 /**
@@ -2044,17 +2079,48 @@ async function initDatabase(d1) {
 /**
  * 主事件监听器 (使用 ES Module 格式)
  */
+function secretMatches(candidate) {
+  if (typeof SECRET !== 'string' || !SECRET || typeof candidate !== 'string' || candidate.length !== SECRET.length) return false
+  let difference = 0
+  for (let index = 0; index < SECRET.length; index++) difference |= SECRET.charCodeAt(index) ^ candidate.charCodeAt(index)
+  return difference === 0
+}
+
+async function protectBotRequest(request, env, management) {
+  if (typeof SECRET !== 'string' || !SECRET) return new Response('Request protection unavailable', { status: 503 })
+  const authorization = request.headers.get('authorization') || ''
+  const candidate = management
+    ? authorization.slice(0, 7).toLowerCase() === 'bearer ' ? authorization.slice(7) : null
+    : request.headers.get('X-Telegram-Bot-Api-Secret-Token')
+  if (!secretMatches(candidate)) return new Response('Unauthorized', { status: 403 })
+  if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } })
+  try {
+    if (!env.REQUEST_LIMITER || typeof env.REQUEST_LIMITER.limit !== 'function') return new Response('Request protection unavailable', { status: 503 })
+    const ip = request.headers.get('cf-connecting-ip') || 'unknown'
+    const { success } = await env.REQUEST_LIMITER.limit({ key: `contact-bot:${ip}` })
+    if (!success) return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } })
+  } catch {
+    return new Response('Request protection unavailable', { status: 503 })
+  }
+  return null
+}
+
 export default {
   async fetch(request, env, ctx) {
     // 初始化配置变量
     initConfig(env)
+
+    const url = new URL(request.url)
+    const management = ['/registerWebhook', '/unRegisterWebhook', '/initDatabase'].includes(url.pathname)
+    if (url.pathname === WEBHOOK || management) {
+      const rejection = await protectBotRequest(request, env, management)
+      if (rejection) return rejection
+    }
     
     // 初始化数据库连接
     if (!db && env.D1) {
       db = new Database(env.D1)
     }
-    
-    const url = new URL(request.url)
     
     if (url.pathname === WEBHOOK) {
       return await handleWebhook({ request, waitUntil: ctx.waitUntil.bind(ctx) })
